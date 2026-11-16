@@ -1,0 +1,181 @@
+name: CI/CD Pipeline
+
+# Fluxo de branches:
+#   feature/*  --PR-->  homolog  (deploy automático em HOMOLOGAÇÃO, namespace oficina-hml)
+#   homolog    --PR-->  main     (deploy automático em PRODUÇÃO, namespace oficina-marimb0ndo)
+# main e homolog são protegidas: merge só via PR com os checks "Testes" e "Qualidade (SonarQube)" verdes.
+
+on:
+  push:
+    branches: [main, homolog]
+  pull_request:
+    branches: [main, homolog]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DOCKER_IMAGE: yaraduarte/oficina-execution-service
+
+jobs:
+  test:
+    name: Testes
+    runs-on: ubuntu-latest
+    # PostgreSQL real para os testes de integração (reserva com SELECT ... FOR UPDATE, outbox)
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: execution_test
+          POSTGRES_USER: execution
+          POSTGRES_PASSWORD: execution123
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U execution -d execution_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DB_HOST: localhost
+      TEST_DB_PORT: 5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Build TypeScript
+        run: npm run build
+      - name: Testes (cobertura mínima de 80%)
+        run: npm run test:ci
+      - name: Resumo da cobertura
+        if: always()
+        run: |
+          node -e "const t=require('./coverage/coverage-summary.json').total; const r=k=>t[k].pct+'%';
+          console.log('### Cobertura de testes\n\n| Métrica | Cobertura |\n|---|---|\n| Statements | '+r('statements')+' |\n| Branches | '+r('branches')+' |\n| Funções | '+r('functions')+' |\n| Linhas | '+r('lines')+' |')" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage/
+
+  # SonarQube efêmero: sobe o servidor como service container, analisa o código com a
+  # cobertura do job de testes e falha o pipeline se o quality gate reprovar.
+  quality:
+    name: Qualidade (SonarQube)
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      sonarqube:
+        image: sonarqube:10.7.0-community
+        env:
+          SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: 'true'
+        ports:
+          - 9000:9000
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+      - name: Aguardar SonarQube
+        run: |
+          for i in $(seq 1 60); do
+            status=$(curl -s http://localhost:9000/api/system/status | sed -E 's/.*"status":"([A-Z_]+)".*/\1/')
+            [ "$status" = "UP" ] && echo "SonarQube UP" && exit 0
+            echo "status=$status ($i/60)"; sleep 5
+          done
+          exit 1
+      - name: Gerar token de análise
+        id: token
+        run: |
+          TOKEN=$(curl -s -u admin:admin -X POST "http://localhost:9000/api/user_tokens/generate" \
+            -d "name=ci-${GITHUB_RUN_ID}" -d "type=GLOBAL_ANALYSIS_TOKEN" | sed -E 's/.*"token":"([^"]+)".*/\1/')
+          [ -n "$TOKEN" ] || { echo "falha ao gerar token"; exit 1; }
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+      - name: Análise SonarQube (aguarda o quality gate)
+        run: |
+          docker run --rm --network host -v "$PWD:/usr/src" -w /usr/src \
+            -e SONAR_HOST_URL=http://localhost:9000 -e SONAR_TOKEN="${{ steps.token.outputs.token }}" \
+            sonarsource/sonar-scanner-cli:11.1 \
+            -Dsonar.qualitygate.wait=true -Dsonar.qualitygate.timeout=300
+      - name: Resumo da qualidade
+        if: always()
+        run: |
+          KEY=$(grep '^sonar.projectKey=' sonar-project.properties | cut -d= -f2)
+          M=$(curl -s -u admin:admin \
+            "http://localhost:9000/api/measures/component?component=${KEY}&metricKeys=alert_status,bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,security_hotspots,ncloc")
+          echo "### SonarQube — ${KEY}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Métrica | Valor |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "$M" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{for(const m of JSON.parse(s).component.measures)console.log('| '+m.metric+' | '+m.value+' |')}catch{console.log('| erro | sem métricas |')}})" >> "$GITHUB_STEP_SUMMARY"
+
+  build-and-push:
+    name: Build e Push Docker
+    runs-on: ubuntu-latest
+    needs: [test, quality]
+    if: github.event_name == 'push'
+    outputs:
+      # Só a tag: o nome da imagem contém o DOCKER_USERNAME e o GitHub descarta outputs com valor de secret
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "tags=${DOCKER_IMAGE}:latest,${DOCKER_IMAGE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=hml-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "tags=${DOCKER_IMAGE}:hml-latest,${DOCKER_IMAGE}:hml-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tag.outputs.tags }}
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push'
+    environment:
+      name: ${{ github.ref_name == 'main' && 'production' || 'homolog' }}
+    env:
+      NAMESPACE: ${{ github.ref_name == 'main' && 'oficina-marimb0ndo' || 'oficina-hml' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copiar manifesto e script para a EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.K3S_HOST }}
+          username: ec2-user
+          key: ${{ secrets.K3S_SSH_PRIVATE_KEY }}
+          source: "k8s/execution.yaml,scripts/deploy.sh"
+          target: /tmp/execution-service
+      - name: Aplicar no k3s
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE: ${{ env.DOCKER_IMAGE }}:${{ needs.build-and-push.outputs.tag }}
+          NAMESPACE: ${{ env.NAMESPACE }}
+          APP_ENV: ${{ github.ref_name == 'main' && 'production' || 'homolog' }}
+          NEW_RELIC_LICENSE_KEY: ${{ secrets.NEW_RELIC_LICENSE_KEY }}
+        with:
+          host: ${{ secrets.K3S_HOST }}
+          username: ec2-user
+          key: ${{ secrets.K3S_SSH_PRIVATE_KEY }}
+          envs: IMAGE,NAMESPACE,APP_ENV,NEW_RELIC_LICENSE_KEY
+          script: |
+            bash /tmp/execution-service/scripts/deploy.sh "$NAMESPACE" "$IMAGE" /tmp/execution-service/k8s/execution.yaml
