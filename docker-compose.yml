@@ -1,0 +1,46 @@
+services:
+  execution-service:
+    build: .
+    ports:
+      - "3002:3000"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      JWT_SECRET: dev-secret
+      RABBITMQ_URL: amqp://oficina:oficina123@rabbitmq:5672
+      DB_HOST: execution-db
+      DB_PORT: 5432
+      DB_NAME: execution_db
+      DB_USER: execution
+      DB_PASS: execution123
+    depends_on:
+      execution-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  execution-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: execution_db
+      POSTGRES_USER: execution
+      POSTGRES_PASSWORD: execution123
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U execution -d execution_db"]
+      interval: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: oficina
+      RABBITMQ_DEFAULT_PASS: oficina123
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      retries: 10
