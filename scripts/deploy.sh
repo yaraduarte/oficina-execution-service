@@ -48,3 +48,11 @@ sed -e "s|__NAMESPACE__|${NS}|g" -e "s|__IMAGE__|${IMAGE}|g" "$MANIFEST" | $K ap
 $K rollout restart deployment/execution-service -n "$NS"
 $K rollout status deployment/execution-service -n "$NS" --timeout=180s
 echo "execution-service atualizado em ${NS} com ${IMAGE}"
+
+# Um único cluster e um único API Gateway (que só aponta para produção): em homologação o serviço
+# não publica Ingress, senão disputaria o mesmo caminho com o de produção no Traefik.
+# Acesso em homologação: kubectl port-forward -n oficina-hml svc/execution-service 8080:80
+if [ "$NS" != "oficina-marimb0ndo" ]; then
+  $K delete ingress execution-service -n "$NS" --ignore-not-found
+  $K delete middleware.traefik.io strip-execucao -n "$NS" --ignore-not-found
+fi
