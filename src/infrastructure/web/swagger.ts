@@ -7,10 +7,11 @@ export function buildSwaggerSpec() {
       openapi: '3.0.0',
       info: {
         title: 'Oficina Marimb0ndo — Execution Service',
-        version: '1.0.0',
+        version: '1.0.1',
         description:
           'Fila de execução, diagnóstico, reparo e estoque de peças. Participa da Saga orquestrada pelo os-service: ' +
-          'recebe comandos via RabbitMQ (execution.commands) e publica eventos execution.* na exchange oficina.events.',
+          'recebe comandos via RabbitMQ (execution.commands) e publica eventos execution.* na exchange oficina.events. ' +
+          'Rotas restritas a funcionários da oficina (JWT do os-service).',
       },
       servers: [{ url: process.env.API_URL ?? '/execucao', description: 'Via API Gateway (/execucao)' }],
       components: {
